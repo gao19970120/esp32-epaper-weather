@@ -1,0 +1,47 @@
+ - platform: mqtt
+   name: "主卧室内温度"
+   state_topic: "home/esp32_epaper/temperature_in"
+   unit_of_measurement: "°C"
+   device_class: temperature
+   value_template: "{{ value | float }}"
+   unique_id: "epaper_temperature_in"
+ 
+ - platform: mqtt
+   name: "主卧室内湿度"
+   state_topic: "home/esp32_epaper/humidity_in"
+   unit_of_measurement: "%"
+   device_class: humidity
+   value_template: "{{ value | int }}"
+   unique_id: "epaper_humidity_in"
+ 
+ - platform: mqtt
+   name: "EPaper 室外温度"
+   state_topic: "home/esp32_epaper/temperature_out"
+   unit_of_measurement: "°C"
+   device_class: temperature
+   value_template: "{{ value | float }}"
+   unique_id: "epaper_temperature_out"
+ 
+ - platform: mqtt
+   name: "EPaper 室外湿度"
+   state_topic: "home/esp32_epaper/humidity_out"
+   unit_of_measurement: "%"
+   device_class: humidity
+   value_template: "{{ value | int }}"
+   unique_id: "epaper_humidity_out"
+ 
+ - platform: mqtt
+   name: "EPaper WiFi RSSI"
+   state_topic: "home/esp32_epaper/wifi_rssi"
+   unit_of_measurement: "dBm"
+   device_class: signal_strength
+   value_template: "{{ value | int }}"
+   unique_id: "epaper_wifi_rssi"
+ 
+ - platform: mqtt
+   name: "EPaper 电池"
+   state_topic: "home/esp32_epaper/battery"
+   unit_of_measurement: "%"
+   device_class: battery
+   value_template: "{{ value | float }}"
+   unique_id: "epaper_battery_percent"
