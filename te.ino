@@ -75,6 +75,7 @@ bool gzip_decode(uint8_t* input, size_t inputLen, String &output) {
 #define SHT4X_I2C_ADDR 0x44
 
 UBYTE *BlackImage = NULL;
+UBYTE *RYImage = NULL;
 float last_indoor_temp = -999.0;
 int last_indoor_humi = -1;
 // MQTT 的实时值（变化时立即更新）
@@ -591,14 +592,13 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
         Paint_DrawString_EN(wifi_x, wifi_y, "WiFi not connected", &Font12, WHITE, BLACK);
     }
 
-    // 显示
-    EPD_4IN2_V2_Display(BlackImage);
+    EPD_4IN2B_V2_Display(BlackImage, RYImage);
 }
 
  /* 入口点 ----------------------------------------------------------------*/
  void setup()
 {
-    printf("EPD_4IN2_V2 Weather Station Demo\r\n");
+    printf("EPD_4IN2B_V2 Weather Station Demo\r\n");
     
     // 1. 启动延迟 5 秒
     printf("Startup Delay 5s...\r\n");
@@ -645,19 +645,22 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
     }
     printf("SHT45 Ready: %.2f C, %d %%\r\n", temp, humi);
 
-    // 初始化电子墨水屏
     printf("e-Paper Init...\r\n");
-    EPD_4IN2_V2_Init();
-    EPD_4IN2_V2_Clear();
+    EPD_4IN2B_V2_Init();
+    EPD_4IN2B_V2_Clear();
     DEV_Delay_ms(500);
 
-    // 分配内存
-    UWORD Imagesize = ((EPD_4IN2_V2_WIDTH % 8 == 0)? (EPD_4IN2_V2_WIDTH / 8 ): (EPD_4IN2_V2_WIDTH / 8 + 1)) * EPD_4IN2_V2_HEIGHT;
+    UWORD Imagesize = ((EPD_4IN2B_V2_WIDTH % 8 == 0)? (EPD_4IN2B_V2_WIDTH / 8 ): (EPD_4IN2B_V2_WIDTH / 8 + 1)) * EPD_4IN2B_V2_HEIGHT;
     if((BlackImage = (UBYTE *)malloc(Imagesize)) == NULL) {
         printf("Failed to apply for black memory...\r\n");
         while (1);
     }
-     Paint_NewImage(BlackImage, EPD_4IN2_V2_WIDTH, EPD_4IN2_V2_HEIGHT, 0, WHITE);
+    if((RYImage = (UBYTE *)malloc(Imagesize)) == NULL) {
+        printf("Failed to apply for red/yellow memory...\r\n");
+        while (1);
+    }
+    Paint_NewImage(BlackImage, EPD_4IN2B_V2_WIDTH, EPD_4IN2B_V2_HEIGHT, 0, WHITE);
+    Paint_NewImage(RYImage, EPD_4IN2B_V2_WIDTH, EPD_4IN2B_V2_HEIGHT, 0, WHITE);
  
      // 初始获取一次室外天气
      float tOut = 0; int hOut = 0; String txtOut = "晴";
@@ -681,9 +684,8 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
     lastSensorHumi = humi;
     lastSensorSampleMs = millis();
  
-     // 电子墨水屏休眠以省电
-     printf("Goto Sleep...\r\n");
-     EPD_4IN2_V2_Sleep();
+    printf("Goto Sleep...\r\n");
+    EPD_4IN2B_V2_Sleep();
  }
  
 /* 主循环 -------------------------------------------------------------*/
@@ -737,15 +739,11 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
        if (changed) {
            printf("Change detected! Updating EPD...\r\n");
            
-           // 唤醒
-           DEV_Module_Init(); // Ensure SPI/GPIO active
-           EPD_4IN2_V2_Init();
+           DEV_Module_Init();
+           EPD_4IN2B_V2_Init();
            
-           // 更新
            updateDisplay(current_temp, current_humi);
-           
-           // 休眠
-           EPD_4IN2_V2_Sleep();
+           EPD_4IN2B_V2_Sleep();
            
            // 更新上次的值
            last_indoor_temp = current_temp;
