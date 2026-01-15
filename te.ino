@@ -1,8 +1,10 @@
 /* 包含文件 ------------------------------------------------------------------*/
 #include "DEV_Config.h"
 #include "EPD.h"
+#include "EPD_GDEH042Z96.h"
 #include "GUI_Paint.h"
 #include "imagedata.h"
+#include "fonts.h"
 #include "font_new_cn.h"
 #include <time.h>
 #include <stdlib.h>
@@ -19,10 +21,12 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <miniz.h>
+#include <memory>
+#include <new>
+#include <vector>
 
 // 解压 Gzip 数据的辅助函数
 bool gzip_decode(uint8_t* input, size_t inputLen, String &output) {
-    // 在堆上分配解压器以避免栈溢出（结构体较大 ~10KB）
     tinfl_decompressor* inflator = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
     if (!inflator) {
         printf("Failed to allocate inflator\r\n");
@@ -30,8 +34,7 @@ bool gzip_decode(uint8_t* input, size_t inputLen, String &output) {
     }
     tinfl_init(inflator);
 
-    // 输出缓冲区
-    const size_t MAX_OUT = 32768; // 增加到 32KB 以确保安全
+    const size_t MAX_OUT = 48000; // 增加缓冲区以容纳较大的预报数据
     uint8_t* outBuf = (uint8_t*)malloc(MAX_OUT);
     if (!outBuf) {
         printf("miniz malloc failed\r\n");
@@ -41,14 +44,12 @@ bool gzip_decode(uint8_t* input, size_t inputLen, String &output) {
 
     size_t in_bytes = inputLen;
     size_t out_bytes = MAX_OUT;
-    int flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF; // 尝试解析 zlib 头
+    int flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
 
-    // 如果是标准 gzip，手动跳过 gzip 头（10字节）
-    // Gzip 头信息：ID1(1f) ID2(8b) CM(08) FLG MTIME(4) XFL OS
     size_t offset = 0;
     if (inputLen > 10 && input[0] == 0x1F && input[1] == 0x8B) {
         offset = 10; 
-        flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF; // 头之后的原始 deflate 流
+        flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
     }
 
     int status = tinfl_decompress(inflator, (const uint8_t*)(input + offset), &in_bytes, outBuf, (uint8_t*)outBuf, &out_bytes, flags);
@@ -67,18 +68,16 @@ bool gzip_decode(uint8_t* input, size_t inputLen, String &output) {
 }
 
 // I2C 引脚
-// 使用标准 ESP32 I2C 引脚
 #define PIN_I2C_SDA 21
 #define PIN_I2C_SCL 22
-
-// 传感器地址（SHT4x 默认为 0x44）
 #define SHT4X_I2C_ADDR 0x44
 
 UBYTE *BlackImage = NULL;
-UBYTE *RYImage = NULL;
+UBYTE *RedImage = NULL;
+
+// 存储变量
 float last_indoor_temp = -999.0;
 int last_indoor_humi = -1;
-// MQTT 的实时值（变化时立即更新）
 float realtime_indoor_temp = -999.0;
 int realtime_indoor_humi = -1;
 unsigned long lastSensorSampleMs = 0;
@@ -87,10 +86,127 @@ int lastSensorHumi = 0;
 double indoorTempWeightedSumMs = 0;
 double indoorHumiWeightedSumMs = 0;
 double indoorWeightTotalMs = 0;
-float last_outdoor_temp = -999.0;
-int last_outdoor_humi = -1;
-String last_weather_text = "晴";
-String last_weather_icon = "100";
+
+const float TEMP_UPDATE_THRESHOLD = 0.3f;
+const int HUMI_UPDATE_THRESHOLD = 2;
+int lastDisplayMinute = -1;
+int lastNtpSyncYday = -1;
+int lastHaUpdateYday = -1;
+
+// 天气和 HA 数据
+struct DailyForecast {
+    String date;
+    String tempMax;
+    String tempMin;
+    String iconDay;
+    String textDay;
+    String precip; // 降水量
+};
+std::vector<DailyForecast> forecasts;
+
+struct HAData {
+    String lunar_year;  // 乙巳蛇年
+    String lunar_date;  // 冬月廿七
+    String shujiu;      // 三九 第8天
+    String birthday_summary; // 滚动显示的生日信息
+};
+HAData haData;
+
+struct CurrentWeather {
+    String temp;
+    String icon;
+    String text;
+    String windDir;
+    String windScale;
+    String windSpeed;
+    String humidity;
+    String pressure;
+    String feelsLike;
+};
+CurrentWeather currentKw;
+
+static String strTrim(const String& s) {
+    int start = 0;
+    int end = (int)s.length() - 1;
+    while (start <= end && (s[start] == ' ' || s[start] == '\r' || s[start] == '\n' || s[start] == '\t')) start++;
+    while (end >= start && (s[end] == ' ' || s[end] == '\r' || s[end] == '\n' || s[end] == '\t')) end--;
+    if (end < start) return "";
+    return s.substring(start, end + 1);
+}
+
+static String normalizeWindDir(const String& s) {
+    if (s.indexOf("无持续风向") >= 0) return "VAR";
+    bool hasN = s.indexOf("北") >= 0;
+    bool hasS = s.indexOf("南") >= 0;
+    bool hasE = s.indexOf("东") >= 0;
+    bool hasW = s.indexOf("西") >= 0;
+    if (hasN && hasE) return "NE";
+    if (hasN && hasW) return "NW";
+    if (hasS && hasE) return "SE";
+    if (hasS && hasW) return "SW";
+    if (hasN) return "N";
+    if (hasS) return "S";
+    if (hasE) return "E";
+    if (hasW) return "W";
+    return s;
+}
+
+static bool extractValueFromMultiline(const String& text, const String& key, String& out) {
+    int pos = text.indexOf(key + ":");
+    int colon = -1;
+    if (pos >= 0) {
+        colon = text.indexOf(':', pos);
+    } else {
+        pos = text.indexOf(key + "：");
+        if (pos >= 0) {
+            colon = text.indexOf('：', pos);
+        }
+    }
+    if (pos < 0) return false;
+    if (colon < 0) return false;
+    int lineEnd = text.indexOf('\n', colon + 1);
+    if (lineEnd < 0) lineEnd = (int)text.length();
+    out = strTrim(text.substring(colon + 1, lineEnd));
+    return out.length() > 0;
+}
+
+static bool httpGetBodyToString(HTTPClient& http, String& out) {
+    out = "";
+    int size = http.getSize();
+    WiFiClient* stream = http.getStreamPtr();
+    if (!stream) return false;
+
+    if (size > 0) {
+        std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[size]);
+        if (!buf) return false;
+        int readn = stream->readBytes(buf.get(), size);
+        if (readn <= 0) return false;
+        if (readn > 2 && buf[0] == 0x1F && buf[1] == 0x8B) {
+            String decoded;
+            if (!gzip_decode(buf.get(), (size_t)readn, decoded)) return false;
+            out = decoded;
+            return true;
+        }
+        out = String((char*)buf.get(), (size_t)readn);
+        return true;
+    }
+
+    uint32_t start = millis();
+    while (millis() - start < 5000) {
+        while (stream->available()) {
+            out += (char)stream->read();
+        }
+        if (!http.connected()) break;
+        delay(5);
+    }
+    if (out.length() == 0) return false;
+    if (out.length() > 2 && (uint8_t)out[0] == 0x1F && (uint8_t)out[1] == 0x8B) {
+        String decoded;
+        if (!gzip_decode((uint8_t*)out.c_str(), (size_t)out.length(), decoded)) return false;
+        out = decoded;
+    }
+    return true;
+}
 
 // 配置结构体
 struct AppConfig {
@@ -106,68 +222,37 @@ struct AppConfig {
 
     String qweather_host;
     String qweather_token;
-    String qweather_location; // 例如："101010100" 或 "116.41,39.92"
+    String qweather_location;
     String qweather_lang = "zh";
     String qweather_unit = "m";
+    String qweather_forecast_days = "3d"; // 3d, 7d
+    int weather_now_refresh_min = 10;
+    int weather_forecast_refresh_h = 6;
 
-    int battery_adc_pin = -1;   // 可选 ADC 引脚
-    float battery_scale = 1.0f; // 缩放到百分比
+    String ha_host;
+    int ha_port = 8123;
+    String ha_token;
+    String ha_lunar_entity = "sensor.lunar_calendar";
+
+    int battery_adc_pin = -1;
+    float battery_scale = 1.0f;
 };
 
 AppConfig CFG;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 unsigned long lastMqttPublishMs = 0;
-unsigned long lastWeatherFetchMs = 0;
+unsigned long lastNowFetchMs = 0;
+unsigned long lastForecastFetchMs = 0;
 bool mqttDiscoveryPublished = false;
 
-// 如果读取成功返回 true
-bool readSensor(float *temp, int *humi) {
-    // 开始测量（高精度）
-    Wire.beginTransmission(SHT4X_I2C_ADDR);
-    Wire.write(0xFD);
-    if (Wire.endTransmission() != 0) {
-        printf("Sensor I2C Error or Not Found\r\n");
-        return false;
-    }
-    
-    delay(20); // 等待测量（SHT4x 高精度最大 8.2ms，安全余量）
-
-    Wire.requestFrom(SHT4X_I2C_ADDR, 6);
-    if (Wire.available() < 6) {
-        printf("Sensor Data Error\r\n");
-        return false;
-    }
-
-    uint8_t rx_bytes[6];
-    for (int i = 0; i < 6; i++) {
-        rx_bytes[i] = Wire.read();
-    }
-
-    // 转换数据
-    uint16_t t_ticks = (rx_bytes[0] << 8) | rx_bytes[1];
-    uint16_t rh_ticks = (rx_bytes[3] << 8) | rx_bytes[4];
-
-    // 演示中略过校验和验证以简化代码
-    
-    *temp = -45 + 175 * ((float)t_ticks / 65535.0);
-    float rh = -6 + 125 * ((float)rh_ticks / 65535.0);
-    if (rh > 100) rh = 100;
-    if (rh < 0) rh = 0;
-    *humi = (int)(rh + 0.5); // 四舍五入到最近的整数
-    
-    // printf("Read Sensor: %.2f C, %d %%\r\n", *temp, *humi);
-    return true;
-}
-
-// 用于简单键（如 "temp": "24"）的最小 JSON 值提取器
+// 辅助函数：提取 JSON
 bool jsonGetNumber(const String& json, const String& key, float* out) {
     int k = json.indexOf("\"" + key + "\"");
     if (k < 0) return false;
     int colon = json.indexOf(':', k);
     if (colon < 0) return false;
     int start = colon + 1;
-    // 跳过空格和引号
     while (start < (int)json.length() && (json[start] == ' ' || json[start] == '\"')) start++;
     int end = start;
     while (end < (int)json.length() && (isdigit(json[end]) || json[end]=='.' || json[end]=='-')) end++;
@@ -190,23 +275,22 @@ bool jsonGetString(const String& json, const String& key, String* out) {
     return true;
 }
 
-// 从 LittleFS 读取 conf.json
 void loadConfig() {
     if (!LittleFS.begin(true)) {
-        printf("LittleFS init failed, using defaults\r\n");
+        printf("LittleFS init failed\r\n");
         return;
     }
     File f = LittleFS.open("/conf.json", "r");
     if (!f) {
-        printf("conf.json not found, using defaults\r\n");
+        printf("conf.json not found\r\n");
         return;
     }
     String json = f.readString();
     f.close();
 
-    // 通过扫描键进行简单解析
-    String s;
-    float n;
+    // 简单解析 (建议生产环境使用 ArduinoJson，但这里沿用简单解析以保持依赖最小化，
+    // 不过后面 fetchHAData 必须用 ArduinoJson 因为结构太复杂)
+    String s; float n;
     if (jsonGetString(json, "wifi_ssid", &s)) CFG.wifi_ssid = s;
     if (jsonGetString(json, "wifi_password", &s)) CFG.wifi_password = s;
     if (jsonGetString(json, "mqtt_host", &s)) CFG.mqtt_host = s;
@@ -221,18 +305,23 @@ void loadConfig() {
     if (jsonGetString(json, "qweather_location", &s)) CFG.qweather_location = s;
     if (jsonGetString(json, "qweather_lang", &s)) CFG.qweather_lang = s;
     if (jsonGetString(json, "qweather_unit", &s)) CFG.qweather_unit = s;
+    if (jsonGetString(json, "qweather_forecast_days", &s)) CFG.qweather_forecast_days = s;
+    if (jsonGetNumber(json, "weather_now_refresh_min", &n)) CFG.weather_now_refresh_min = (int)n;
+    if (jsonGetNumber(json, "weather_forecast_refresh_h", &n)) CFG.weather_forecast_refresh_h = (int)n;
+
+    if (jsonGetString(json, "ha_host", &s)) CFG.ha_host = s;
+    if (jsonGetNumber(json, "ha_port", &n)) CFG.ha_port = (int)n;
+    if (jsonGetString(json, "ha_token", &s)) CFG.ha_token = s;
+    if (jsonGetString(json, "ha_lunar_entity", &s)) CFG.ha_lunar_entity = s;
 
     if (jsonGetNumber(json, "battery_adc_pin", &n)) CFG.battery_adc_pin = (int)n;
     if (jsonGetNumber(json, "battery_scale", &n)) CFG.battery_scale = n;
 
-    printf("Config loaded\r\n");
+    printf("Config loaded. HA Host: %s\r\n", CFG.ha_host.c_str());
 }
 
 void connectWiFi() {
-    if (CFG.wifi_ssid.length() == 0) {
-        printf("WiFi SSID missing in conf.json\r\n");
-        return;
-    }
+    if (CFG.wifi_ssid.length() == 0) return;
     printf("Connecting WiFi %s...\r\n", CFG.wifi_ssid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(CFG.wifi_ssid.c_str(), CFG.wifi_password.c_str());
@@ -242,572 +331,537 @@ void connectWiFi() {
         printf(".");
         tries++;
     }
-    printf("\r\n");
-    if (WiFi.status() == WL_CONNECTED) {
-        printf("WiFi connected, IP: %s\r\n", WiFi.localIP().toString().c_str());
-    } else {
-        printf("WiFi connect failed\r\n");
-    }
+    printf("\r\nWiFi Status: %d\r\n", WiFi.status());
 }
 
-void delayWithOTA(unsigned long ms) {
-    unsigned long start = millis();
-    while (millis() - start < ms) {
-        ArduinoOTA.handle();
-        delay(10);
-    }
-}
-
-void mqttSetup() {
-    if (CFG.mqtt_host.length() == 0) {
-        printf("MQTT host missing, skip MQTT\r\n");
-        return;
-    }
-    mqttClient.setServer(CFG.mqtt_host.c_str(), CFG.mqtt_port);
-}
-
-void mqttEnsureConnected() {
-    if (CFG.mqtt_host.length() == 0) return;
-    while (!mqttClient.connected()) {
-        String clientId = "esp32_epaper_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-        printf("MQTT connecting...\r\n");
+static bool mqttEnsureConnected() {
+    if (CFG.mqtt_host.length() == 0) return false;
+    if (!mqttClient.connected()) {
+        mqttClient.setKeepAlive(30);
+        String cid = "esp32_epaper_" + String((uint32_t)ESP.getEfuseMac(), HEX);
         bool ok;
         if (CFG.mqtt_user.length() > 0) {
-            ok = mqttClient.connect(clientId.c_str(), CFG.mqtt_user.c_str(), CFG.mqtt_pass.c_str());
+            ok = mqttClient.connect(cid.c_str(), CFG.mqtt_user.c_str(), CFG.mqtt_pass.c_str());
         } else {
-            ok = mqttClient.connect(clientId.c_str());
+            ok = mqttClient.connect(cid.c_str());
         }
-        if (ok) {
-            printf("MQTT connected\r\n");
-        } else {
-            printf("MQTT connect failed, rc=%d; retry in 2s\r\n", mqttClient.state());
-            delay(2000);
-        }
+        if (!ok) return false;
     }
+    return true;
 }
 
-String device_class_to_topic_suffix(const char* unique_id) {
-    if (strcmp(unique_id, "epaper_temperature_in") == 0) return "temperature_in";
-    if (strcmp(unique_id, "epaper_humidity_in") == 0) return "humidity_in";
-    if (strcmp(unique_id, "epaper_temperature_out") == 0) return "temperature_out";
-    if (strcmp(unique_id, "epaper_humidity_out") == 0) return "humidity_out";
-    if (strcmp(unique_id, "epaper_wifi_rssi") == 0) return "wifi_rssi";
-    if (strcmp(unique_id, "epaper_battery_percent") == 0) return "battery";
-    return "";
+static void mqttPublishKV(const String& sub, const String& payload) {
+    if (CFG.mqtt_base.length() == 0) return;
+    String t = CFG.mqtt_base + "/" + sub;
+    mqttClient.publish(t.c_str(), payload.c_str(), true);
 }
 
-void mqttPublishDiscovery(const char* unique_id, const char* name, const char* device_class, const char* unit_of_measurement) {
-    if (!mqttClient.connected()) return;
+// 传感器读取
+bool readSensor(float *temp, int *humi) {
+    Wire.beginTransmission(SHT4X_I2C_ADDR);
+    Wire.write(0xFD);
+    if (Wire.endTransmission() != 0) return false;
+    delay(20);
+    Wire.requestFrom(SHT4X_I2C_ADDR, 6);
+    if (Wire.available() < 6) return false;
+    uint8_t rx[6];
+    for (int i = 0; i < 6; i++) rx[i] = Wire.read();
+    uint16_t t_ticks = (rx[0] << 8) | rx[1];
+    uint16_t rh_ticks = (rx[3] << 8) | rx[4];
+    *temp = -45 + 175 * ((float)t_ticks / 65535.0);
+    float rh = -6 + 125 * ((float)rh_ticks / 65535.0);
+    if (rh > 100) rh = 100; if (rh < 0) rh = 0;
+    *humi = (int)(rh + 0.5);
+    return true;
+}
 
-    // 使用标准 Home Assistant 发现前缀 "homeassistant"
-    String topic = String("homeassistant") + "/sensor/" + unique_id + "/config";
+// 获取 HA 数据
+bool fetchHAData() {
+    if (CFG.ha_host.length() == 0 || CFG.ha_token.length() == 0) return false;
 
-    JsonDocument doc;
-    doc["name"] = name;
-    doc["uniq_id"] = unique_id;
-    doc["stat_t"] = String(CFG.mqtt_base) + "/" + device_class_to_topic_suffix(unique_id);
-    if (unit_of_measurement) {
-        doc["unit_of_meas"] = unit_of_measurement;
-    }
-    if (device_class) {
-        doc["dev_cla"] = device_class;
-    }
+    HTTPClient http;
+    String url = "http://" + CFG.ha_host + ":" + String(CFG.ha_port) + "/api/states/" + CFG.ha_lunar_entity;
     
-    // 添加设备信息
-    JsonObject device = doc["dev"].to<JsonObject>();
-    device["ids"] = "esp32_epaper_v1";
-    device["name"] = "ESP32 E-Paper Display";
-    device["mf"] = "Espressif";
-    device["mdl"] = "ESP32";
-    device["sw"] = "1.0";
+    printf("Fetching HA Data: %s\r\n", url.c_str());
+    
+    http.begin(url);
+    http.addHeader("Authorization", "Bearer " + CFG.ha_token);
+    http.addHeader("Content-Type", "application/json");
 
-    String payload;
-    serializeJson(doc, payload);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+        String payload = http.getString();
+        
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, payload);
+        if (error) {
+            printf("HA JSON parse failed: %s\r\n", error.c_str());
+            http.end();
+            return false;
+        }
 
-    // 发布时设置 retain 标志为 true，以便 HA 重启后能获取到
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
-}
+        JsonObject attrs = doc["attributes"];
 
-float readBatteryPercent() {
-    if (CFG.battery_adc_pin < 0) return -1.0f;
-    int raw = analogRead(CFG.battery_adc_pin);
-    float voltage = (float)raw / 4095.0f * 3.3f; // 简单计算
-    float percent = voltage * CFG.battery_scale; // 用户定义的比例
-    if (percent > 100) percent = 100;
-    if (percent < 0) percent = 0;
-    return percent;
-}
+        haData.lunar_year = "";
+        haData.lunar_date = "";
+        haData.shujiu = "";
 
-void publishMetrics(float indoorTemp, int indoorHumi, float outdoorTemp, int outdoorHumi) {
-    if (CFG.mqtt_host.length() == 0) return;
-    mqttEnsureConnected();
+        if (attrs.containsKey("今天的农历日期")) {
+            JsonVariant v = attrs["今天的农历日期"];
+            if (v.is<JsonObject>()) {
+                JsonObject o = v.as<JsonObject>();
+                if (o.containsKey("年")) haData.lunar_year = o["年"].as<String>();
+                if (o.containsKey("日期")) haData.lunar_date = o["日期"].as<String>();
+                if (o.containsKey("数九")) haData.shujiu = o["数九"].as<String>();
+            } else if (v.is<const char*>()) {
+                String t = v.as<String>();
+                extractValueFromMultiline(t, "年", haData.lunar_year);
+                extractValueFromMultiline(t, "日期", haData.lunar_date);
+                extractValueFromMultiline(t, "数九", haData.shujiu);
+            }
+        }
 
-    char buf[64];
-    String base = CFG.mqtt_base;
+        if (haData.lunar_date.length() == 0 || haData.lunar_year.length() == 0) {
+            for (JsonPair kv : attrs) {
+                String k = kv.key().c_str();
+                if (k.indexOf("农历") >= 0 && k.indexOf("日期") >= 0) {
+                    JsonVariant v = kv.value();
+                    if (v.is<JsonObject>()) {
+                        JsonObject o = v.as<JsonObject>();
+                        if (haData.lunar_year.length() == 0 && o.containsKey("年")) haData.lunar_year = o["年"].as<String>();
+                        if (haData.lunar_date.length() == 0 && o.containsKey("日期")) haData.lunar_date = o["日期"].as<String>();
+                        if (haData.shujiu.length() == 0 && o.containsKey("数九")) haData.shujiu = o["数九"].as<String>();
+                    } else if (v.is<const char*>()) {
+                        String t = v.as<String>();
+                        if (haData.lunar_year.length() == 0) extractValueFromMultiline(t, "年", haData.lunar_year);
+                        if (haData.lunar_date.length() == 0) extractValueFromMultiline(t, "日期", haData.lunar_date);
+                        if (haData.shujiu.length() == 0) extractValueFromMultiline(t, "数九", haData.shujiu);
+                    }
+                    break;
+                }
+            }
+        }
 
-    dtostrf(indoorTemp, 0, 2, buf);
-    mqttClient.publish((base + "/temperature_in").c_str(), buf, true);
+        if (haData.lunar_year.length() == 0 && attrs.containsKey("年")) haData.lunar_year = attrs["年"].as<String>();
+        if (haData.lunar_date.length() == 0 && attrs.containsKey("日期")) haData.lunar_date = attrs["日期"].as<String>();
+        if (haData.shujiu.length() == 0 && attrs.containsKey("数九")) haData.shujiu = attrs["数九"].as<String>();
 
-    snprintf(buf, sizeof(buf), "%d", indoorHumi);
-    mqttClient.publish((base + "/humidity_in").c_str(), buf, true);
+        if (haData.lunar_date.length() == 0 && attrs.containsKey("lunar_date")) haData.lunar_date = attrs["lunar_date"].as<String>();
+        if (haData.lunar_year.length() == 0 && attrs.containsKey("lunar_year")) haData.lunar_year = attrs["lunar_year"].as<String>();
 
-    dtostrf(outdoorTemp, 0, 2, buf);
-    mqttClient.publish((base + "/temperature_out").c_str(), buf, true);
-
-    snprintf(buf, sizeof(buf), "%d", outdoorHumi);
-    mqttClient.publish((base + "/humidity_out").c_str(), buf, true);
-
-    // WiFi 信号强度
-    snprintf(buf, sizeof(buf), "%d", WiFi.RSSI());
-    mqttClient.publish((base + "/wifi_rssi").c_str(), buf, true);
-
-    // 电池
-    float batt = readBatteryPercent();
-    if (batt >= 0) {
-        dtostrf(batt, 0, 1, buf);
-        mqttClient.publish((base + "/battery").c_str(), buf, true);
-    }
-}
-
-bool fetchOutdoorWeather(float* tempOut, int* humiOut, String* textOut) {
-    if (CFG.qweather_host.length() == 0 || CFG.qweather_token.length() == 0 || CFG.qweather_location.length() == 0) {
+        String summary = "";
+        if (attrs.containsKey("生日") && attrs["生日"].is<JsonArray>()) {
+            JsonArray birthdays = attrs["生日"].as<JsonArray>();
+            for (JsonObject b : birthdays) {
+                String name = b["名称"].as<String>();
+                String daysStr = "";
+                if (b.containsKey("阳历天数")) daysStr = String(b["阳历天数"].as<int>());
+                else if (b.containsKey("阳历天数说明")) daysStr = b["阳历天数说明"].as<String>();
+                if (daysStr.length() > 0) summary += name + " 距离" + daysStr + "天  ";
+            }
+        }
+        haData.birthday_summary = summary;
+        
+        printf("HA Data: Year=%s Date=%s BD=%s\r\n", haData.lunar_year.c_str(), haData.lunar_date.c_str(), haData.birthday_summary.c_str());
+        http.end();
+        return true;
+    } else {
+        printf("HA HTTP Error: %d\r\n", httpCode);
+        http.end();
         return false;
     }
-    if (WiFi.status() != WL_CONNECTED) return false;
+}
 
-    String url = String("https://") + CFG.qweather_host + "/v7/weather/now?location=" + CFG.qweather_location + "&lang=" + CFG.qweather_lang + "&unit=" + CFG.qweather_unit;
-    HTTPClient http;
-    
-    // 在 if 块外部声明 client 以在 http.GET() 期间保持存活
+// 获取天气预报
+bool fetchWeatherNow() {
+    if (CFG.qweather_token.length() == 0) return false;
+
     WiFiClientSecure client;
     client.setInsecure();
+    HTTPClient http;
 
-    if (url.startsWith("https://")) {
-        http.begin(client, url);
-    } else {
-        http.begin(url);
-    }
-    // http.addHeader("Authorization", String("Bearer ") + CFG.qweather_token);
-    http.addHeader("X-QW-Api-Key", CFG.qweather_token);
-    // 显式接受 gzip
-    http.addHeader("Accept-Encoding", "gzip");
-    
-    int code = http.GET();
-    String payload = "";
-    
-    if (code == 200) {
-        // 读取原始流
-        int size = http.getSize();
-        WiFiClient *stream = http.getStreamPtr();
-        
-        if (size > 0) {
-            // 读取到缓冲区
-            uint8_t* buff = (uint8_t*)malloc(size);
-            if (buff) {
-                int len = stream->readBytes(buff, size);
-                
-                // 检查 Gzip 魔数头：0x1F 0x8B
-                if (len > 2 && buff[0] == 0x1F && buff[1] == 0x8B) {
-                    printf("Detected Gzip content, decompressing...\r\n");
-                    if (!gzip_decode(buff, len, payload)) {
-                        printf("Gzip decode failed\r\n");
-                    }
-                } else {
-                    // 不是 gzip，当作字符串处理
-                    payload = String((char*)buff, len);
-                }
-                free(buff);
-            } else {
-                printf("Malloc failed for HTTP body\r\n");
+    // 获取实时天气
+    String urlNow = "https://" + CFG.qweather_host + "/v7/weather/now?location=" + CFG.qweather_location + "&key=" + CFG.qweather_token + "&lang=" + CFG.qweather_lang + "&unit=" + CFG.qweather_unit;
+    http.begin(client, urlNow);
+    int codeNow = http.GET();
+    if (codeNow == 200) {
+        String payload;
+        if (httpGetBodyToString(http, payload)) {
+            JsonDocument doc;
+            if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+                JsonObject now = doc["now"];
+                currentKw.temp = now["temp"].as<String>();
+                currentKw.icon = now["icon"].as<String>();
+                currentKw.text = now["text"].as<String>();
+                currentKw.windDir = now["windDir"].as<String>();
+                currentKw.windScale = now["windScale"].as<String>();
+                currentKw.windSpeed = now["windSpeed"].as<String>();
+                currentKw.humidity = now["humidity"].as<String>();
+                currentKw.pressure = now["pressure"].as<String>();
+                currentKw.feelsLike = now["feelsLike"].as<String>();
             }
         }
     } else {
-        payload = http.getString(); // Get error message if any
-    }
-    
-    // 调试：打印 payload 的前100个字符以检查是否为明文
-    printf("HTTP %d, Payload Preview: %.100s\r\n", code, payload.c_str());
-
-    if (code != 200) {
-        http.end();
-        printf("QWeather HTTP error: %d\r\n", code);
-        printf("Response Payload: %s\r\n", payload.c_str());
-        return false;
+        printf("QWeather now HTTP %d\r\n", codeNow);
     }
     http.end();
-
-    // 解析 now.temp, now.humidity, now.text
-    float t = 0;
-    float h = 0;
-    String txt;
-    String iconCode;
-    bool okT = false, okH = false, okX = false, okI = false;
-
-    // 找到 "now": { ... }，然后查找键
-    int nowIdx = payload.indexOf("\"now\"");
-    if (nowIdx >= 0) {
-        int brace = payload.indexOf('{', nowIdx);
-        int endBrace = payload.indexOf('}', brace);
-        String nowObj = payload.substring(brace, endBrace + 1);
-        okT = jsonGetNumber(nowObj, "temp", &t);
-        okH = jsonGetNumber(nowObj, "humidity", &h);
-        okX = jsonGetString(nowObj, "text", &txt);
-        okI = jsonGetString(nowObj, "icon", &iconCode);
-    }
-    if (okT) *tempOut = t;
-    if (okH) *humiOut = (int)(h + 0.5f);
-    if (okX) *textOut = txt;
-    if (okI) {
-        last_weather_icon = iconCode;
-        printf("Weather Icon Code: %s\r\n", iconCode.c_str());
-    }
-    return okT || okH || okX || okI;
+    return true;
 }
 
-bool drawIconFromFS(const String& code, int x, int y, int w, int h) {
-    if (!LittleFS.begin(true)) return false;
-    String path = "/icons_bin/" + code + ".bin";
-    printf("Loading icon from: %s\r\n", path.c_str());
-    File f = LittleFS.open(path, "r");
-    if (!f) {
-        printf("Icon file not found: %s\r\n", path.c_str());
-        return false;
+bool fetchWeatherForecast() {
+    if (CFG.qweather_token.length() == 0) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    // 获取预报
+    String urlDaily = "https://" + CFG.qweather_host + "/v7/weather/" + CFG.qweather_forecast_days + "?location=" + CFG.qweather_location + "&key=" + CFG.qweather_token + "&lang=" + CFG.qweather_lang + "&unit=" + CFG.qweather_unit;
+    http.begin(client, urlDaily);
+    int codeDaily = http.GET();
+    if (codeDaily == 200) {
+        String payload;
+        if (httpGetBodyToString(http, payload)) {
+            JsonDocument doc;
+            if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+                JsonArray daily = doc["daily"];
+                forecasts.clear();
+                for (JsonObject d : daily) {
+                    DailyForecast f;
+                    f.date = d["fxDate"].as<String>();
+                    f.tempMax = d["tempMax"].as<String>();
+                    f.tempMin = d["tempMin"].as<String>();
+                    f.iconDay = d["iconDay"].as<String>();
+                    f.textDay = d["textDay"].as<String>();
+                    f.precip = d["precip"].as<String>();
+                    forecasts.push_back(f);
+                }
+            }
+        }
+    } else {
+        printf("QWeather daily HTTP %d\r\n", codeDaily);
     }
-    size_t wbyte = (w % 8) ? (w / 8) + 1 : (w / 8);
-    size_t need = wbyte * h;
-    uint8_t* buf = (uint8_t*)malloc(need);
-    if (!buf) {
+    http.end();
+    return true;
+}
+
+static int guessSquareIconSize(size_t bytes, int fallback) {
+    const int sizes[] = {24, 32, 40, 48, 56, 64};
+    for (int s : sizes) {
+        size_t wbyte = (size_t)((s + 7) / 8);
+        if (wbyte * (size_t)s == bytes) return s;
+    }
+    return fallback;
+}
+
+bool drawIconFromFS(const String& code, int x, int y, int preferredSize) {
+    if (!LittleFS.begin(true)) return false;
+    String base = (preferredSize <= 24) ? "/icons_bin24/" : "/icons_bin/";
+    String path = base + code + ".bin";
+    File f = LittleFS.open(path, "r");
+    if (!f && preferredSize <= 24) {
+        path = "/icons_bin/" + code + ".bin";
+        f = LittleFS.open(path, "r");
+    }
+    if (!f) return false;
+
+    size_t fileSize = f.size();
+    int iconSize = guessSquareIconSize(fileSize, preferredSize);
+    size_t need = (size_t)((iconSize + 7) / 8) * (size_t)iconSize;
+    if (need != fileSize) {
         f.close();
         return false;
     }
+    uint8_t* buf = (uint8_t*)malloc(need);
+    if (!buf) { f.close(); return false; }
     size_t readn = f.read(buf, need);
     f.close();
-    if (readn != need) {
-        free(buf);
-        return false;
-    }
-    // 图标 bin 格式：1=白，0=黑
-    Paint_DrawImage(buf, x, y, w, h);
+    if (readn != need) { free(buf); return false; }
+    Paint_DrawImage(buf, x, y, iconSize, iconSize);
     free(buf);
     return true;
 }
 
-void updateDisplay(float indoor_temp, int indoor_humi) {
-    if (BlackImage == NULL) return;
-
-    printf("Updating Display: In=%.2fC, %d%%\r\n", indoor_temp, indoor_humi);
-
-    Paint_SelectImage(BlackImage);
-    Paint_Clear(WHITE);
-
-    // 数据
-    float outdoor_temp = 28.0; // 虚拟室外数据
-    int outdoor_humi = 45;     // 虚拟室外数据
-
-    char buf[50];
-
-    // 1. 头部（黑底白字）
-    Paint_DrawRectangle(0, 0, 400, 50, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+// 绘制图表 (简单折线图)
+void drawChart(int x, int y, int w, int h, const std::vector<float>& values, const char* label) {
+    Paint_DrawRectangle(x, y, x + w, y + h, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    Paint_DrawRectangle(x, y, x + w, y + h, BLACK, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
     
-    // 绘制日期
-    struct tm timeinfo;
-    if(!getLocalTime(&timeinfo)){
-        printf("Failed to obtain time\r\n");
-        sprintf(buf, "2024年1月1日");
-    } else {
-        sprintf(buf, "%d年%d月%d日", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    if (values.size() < 2) return;
+
+    float minV = 1000, maxV = -1000;
+    for (float v : values) {
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
     }
-    // 粗略的居中计算（假设平均每个字符/数字约 32px）
-    // 9 chars * 32 = 288. Center ~56.
-    Paint_DrawString_CN(56, 9, buf, &FontNewCN, WHITE, BLACK);
-
-    // 2. 垂直分割线
-    Paint_DrawLine(200, 50, 200, 300, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
-
-    // 3. 左侧区域（室外）
-    Paint_DrawString_CN(68, 60, "室外", &FontNewCN, BLACK, WHITE);
-
-    if (!last_weather_icon.length() || !drawIconFromFS(last_weather_icon, 72, 104, 48, 48)) {
-        Paint_DrawString_CN(84, 150, last_weather_text.c_str(), &FontNewCN, BLACK, WHITE);
-    }
-
-    // 室外温度
-    Paint_DrawString_CN(29, 190 - 4, "温度", &FontNewCN, BLACK, WHITE);
-    sprintf(buf, "%.1f", last_outdoor_temp > -900 ? last_outdoor_temp : outdoor_temp);
-    int numlen = strlen(buf);
-    int label_x_out = 29;
-    int label_w_out = FontNewCN.Width * 2;
-    int gap_out = 6;
-    int max_right_out = 200 - 4;
-    int total_w_out = Font24.Width * numlen + FontNewCN.Width;
-    int temp_x_out = label_x_out + label_w_out + gap_out;
-    int min_x_out = max_right_out - total_w_out;
-    if (temp_x_out > min_x_out) temp_x_out = min_x_out;
-    Paint_DrawString_EN(temp_x_out, 190, buf, &Font24, WHITE, BLACK);
-    Paint_DrawString_CN(temp_x_out + Font24.Width * numlen, 190 - 4, "℃", &FontNewCN, BLACK, WHITE);
-
-    // 室外湿度
-    Paint_DrawString_CN(59, 230, "湿度", &FontNewCN, BLACK, WHITE);
-    sprintf(buf, "%d", last_outdoor_humi > -1 ? last_outdoor_humi : outdoor_humi);
-    int hum_x_out = 59 + FontNewCN.Width * 2 + 8;
-    Paint_DrawString_EN(hum_x_out, 230 + 4, buf, &Font24, WHITE, BLACK);
-    int humlen = strlen(buf);
-    Paint_DrawString_CN(hum_x_out + Font24.Width * humlen, 230, "%", &FontNewCN, BLACK, WHITE);
-
-
-    // 4. 右侧区域（室内）
-    Paint_DrawString_CN(268, 60, "室内", &FontNewCN, BLACK, WHITE);
-
-    // 室内温度
-    Paint_DrawString_CN(229, 120 - 4, "温度", &FontNewCN, BLACK, WHITE);
-    sprintf(buf, "%.1f", indoor_temp);
-    int temp_x_in = 229 + FontNewCN.Width * 2 + 8;
-    Paint_DrawString_EN(temp_x_in, 120 , buf, &Font24, WHITE, BLACK);
-    numlen = strlen(buf);
-    Paint_DrawString_CN(temp_x_in + Font24.Width * numlen, 120 - 4, "℃", &FontNewCN, BLACK, WHITE);
-
-    // 室内湿度
-    Paint_DrawString_CN(259, 160, "湿度", &FontNewCN, BLACK, WHITE);
-    sprintf(buf, "%d", indoor_humi);
-    int hum_x_in = 259 + FontNewCN.Width * 2 + 8;
-    Paint_DrawString_EN(hum_x_in, 160 + 4, buf, &Font24, WHITE, BLACK);
-    humlen = strlen(buf);
-    Paint_DrawString_CN(hum_x_in + Font24.Width * humlen, 160, "%", &FontNewCN, BLACK, WHITE);
-
-    // WiFi 状态（右下角）
-    int wifi_y = 270;
-    if (WiFi.status() == WL_CONNECTED) {
-        String ip = WiFi.localIP().toString();
-        sprintf(buf, "IP %s", ip.c_str());
-        // 计算宽度以右对齐
-        // int str_width = strlen(buf) * Font12.Width;
-        // int wifi_x = 400 - str_width - 10; // 右对齐，保留 10px 边距
+    // 留余量
+    float range = maxV - minV;
+    if (range == 0) range = 1;
+    
+    // 绘制曲线
+    int prevX = 0, prevY = 0;
+    float stepX = (float)w / (values.size() - 1);
+    
+    for (size_t i = 0; i < values.size(); i++) {
+        int px = x + (int)(i * stepX);
+        // y 轴翻转，数值越大越靠上
+        int py = y + h - (int)((values[i] - minV) / range * (h - 10)) - 5; 
         
-        // 硬编码以确保按要求右对齐
-        int wifi_x = 280; 
+        if (i > 0) {
+            Paint_DrawLine(prevX, prevY, px, py, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+        }
+        prevX = px;
+        prevY = py;
         
-        Paint_DrawString_EN(wifi_x, wifi_y, buf, &Font12, WHITE, BLACK);
-    } else {
-        int wifi_x = 10;
-        Paint_DrawString_EN(wifi_x, wifi_y, "WiFi not connected", &Font12, WHITE, BLACK);
+        // 绘制点
+        Paint_DrawPoint(px, py, BLACK, DOT_PIXEL_2X2, DOT_STYLE_DFT);
     }
-
-    EPD_4IN2B_V2_Display(BlackImage, RYImage);
+    
+    // 标签
+    Paint_DrawString_CN(x + 2, y + 2, label, &FontCN16, BLACK, WHITE);
 }
 
- /* 入口点 ----------------------------------------------------------------*/
- void setup()
-{
-    printf("EPD_4IN2B_V2 Weather Station Demo\r\n");
+void updateDisplay(float indoor_temp, int indoor_humi) {
+    if (BlackImage == NULL) return;
+    Paint_SelectImage(BlackImage);
+    Paint_Clear(WHITE);
+    Paint_SelectImage(RedImage);
+    Paint_Clear(WHITE);
     
-    // 1. 启动延迟 5 秒
-    printf("Startup Delay 5s...\r\n");
-    delayWithOTA(5000);
- 
+    // 切换回 Black 用于主要绘制
+    Paint_SelectImage(BlackImage);
+
+    // 1. 左上角：日期区域 (黑底白字) -> 参数 (Fg=WHITE, Bg=BLACK)
+    // 区域: 0,0 - 160,100
+    Paint_DrawRectangle(0, 0, 160, 100, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    
+    struct tm timeinfo;
+    bool hasTime = getLocalTime(&timeinfo);
+    
+    char buf[64];
+    if (hasTime) {
+        const char* weekDays[] = {"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
+
+        // 三行布局：
+        // 1) x月x日（公历） - FontCN24
+        snprintf(buf, sizeof(buf), "%d月%d日", timeinfo.tm_mon + 1, timeinfo.tm_mday);
+        Paint_DrawString_CN(10, 6, buf, &FontCN24, WHITE, BLACK);
+
+        // 2) 农历xxx年 - 下移至 Y=40
+        String lunarYearLine = "农历";
+        if (haData.lunar_year.length() > 0) lunarYearLine += haData.lunar_year;
+        Paint_DrawString_CN(10, 40, lunarYearLine.c_str(), &FontCN16, WHITE, BLACK);
+
+        // 3) x月x日（农历） 星期x - 下移至 Y=66
+        String lunarDateLine = haData.lunar_date;
+        if (lunarDateLine.length() == 0) lunarDateLine = " ";
+        lunarDateLine += " ";
+        lunarDateLine += weekDays[timeinfo.tm_wday];
+        Paint_DrawString_CN(10, 66, lunarDateLine.c_str(), &FontCN16, WHITE, BLACK);
+    }
+
+    // 2. 右上角：时间与天气区域背景填充为白色
+    Paint_DrawRectangle(160, 0, 400, 100, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+
+    if (hasTime) {
+        sprintf(buf, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+        Paint_DrawRectangle(160, 0, 260, 40, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+        Paint_DrawString_CN(170, 12, buf, &FontCN24_Num, BLACK, WHITE);
+    }
+    
+    // 天气图标（强制使用代码 150）
+    if (currentKw.icon.length() > 0) {
+        drawIconFromFS(currentKw.icon, 260, 4, 48);
+    }
+    
+    // 天气文字
+    Paint_DrawString_CN(330, 14, currentKw.text.c_str(), &FontCN32, BLACK, WHITE);
+    
+    int detailY = 60;
+    String windLine = currentKw.windDir + " " + currentKw.windScale + "级 " + currentKw.windSpeed + "km/h";
+    Paint_DrawString_CN(170, detailY, windLine.c_str(), &FontCN16, BLACK, WHITE);
+
+    String tempLine = "温度 " + currentKw.temp + "℃ 体感 " + currentKw.feelsLike + "℃";
+    Paint_DrawString_CN(170, detailY + 18, tempLine.c_str(), &FontCN16, BLACK, WHITE);
+
+    // 3. 中间区域：室内与预报
+    // 分割线
+    Paint_DrawLine(0, 100, 400, 100, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+    
+    // 左侧：室内温湿度 (0,100 - 160,270)
+    snprintf(buf, sizeof(buf), "温度: %.1f℃", indoor_temp);
+    Paint_DrawString_CN(10, 120, buf, &FontCN16, BLACK, WHITE);
+    snprintf(buf, sizeof(buf), "湿度: %d%%", indoor_humi);
+    Paint_DrawString_CN(10, 146, buf, &FontCN16, BLACK, WHITE);
+    
+    Paint_DrawRectangle(160, 100, 400, 270, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    Paint_DrawLine(160, 100, 160, 270, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+    Paint_DrawLine(0, 100, 400, 100, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+    
+    int fy = 110;
+    int fx = 170;
+    // 表头
+    // Paint_DrawString_CN(fx, fy, "今日 明日 后天", &FontNewCN, WHITE, BLACK);
+    
+    // 列表显示
+    for (size_t i = 0; i < forecasts.size() && i < 3; i++) {
+        const auto& f = forecasts[i];
+        // 日期
+        String dateStr = f.date.substring(5); // MM-DD
+        Paint_DrawString_CN(fx + i*75, fy, dateStr.c_str(), &FontCN12, BLACK, WHITE);
+        
+        // 图标
+        drawIconFromFS(f.iconDay, fx + i*75 + 20, fy + 18, 24);
+        
+        // 温度
+        String tempRange = f.tempMin + "~" + f.tempMax + "℃";
+        Paint_DrawString_CN(fx + i*75, fy + 60, tempRange.c_str(), &FontCN12, BLACK, WHITE);
+        
+        // 文字
+        Paint_DrawString_CN(fx + i*75, fy + 80, f.textDay.c_str(), &FontCN16, BLACK, WHITE);
+    }
+
+    // 4. 底部：生日信息 (0,270 - 400,300)
+    Paint_DrawLine(0, 270, 400, 270, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+    
+    if (haData.birthday_summary.length() > 0) {
+        // 整行静态显示（超出屏幕部分自动裁切）
+        Paint_DrawString_CN(5, 275, haData.birthday_summary.c_str(), &FontCN16, BLACK, WHITE);
+    } else {
+        Paint_DrawString_CN(5, 275, "无生日信息", &FontCN16, BLACK, WHITE);
+    }
+
+    EPD_GDEH042Z96_Display(BlackImage, RedImage);
+}
+
+void setup() {
+    printf("EPD Start\r\n");
+    delay(1000);
     DEV_Module_Init();
- 
-    // 加载配置
-   loadConfig();
- 
-     // WiFi 连接
+    loadConfig();
     connectWiFi();
     
-    // 进行任何网络调用前等待 3 秒以确保 WiFi 稳定
     if (WiFi.status() == WL_CONNECTED) {
-        printf("WiFi Connected. Syncing time...\r\n");
-        configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "cn.ntp.org.cn");
-        ArduinoOTA.setHostname("esp32_epaper");
-        if (CFG.ota_password.length() > 0) {
-            ArduinoOTA.setPassword(CFG.ota_password.c_str());
-        }
-        ArduinoOTA.onStart([]() { printf("OTA Start\r\n"); });
-        ArduinoOTA.onEnd([]() { printf("OTA End\r\n"); });
-        ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) { printf("OTA %u%%\r\n", (progress * 100) / total); });
-        ArduinoOTA.onError([](ota_error_t error) { printf("OTA Error %d\r\n", error); });
-        ArduinoOTA.begin();
-        printf("Waiting 3s before API access...\r\n");
-        delayWithOTA(3000);
+        configTime(8 * 3600, 0, "ntp.aliyun.com");
+        mqttClient.setServer(CFG.mqtt_host.c_str(), CFG.mqtt_port);
+        mqttEnsureConnected();
     }
+    
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+    EPD_GDEH042Z96_Init();
+    EPD_GDEH042Z96_Clear();
+    
+    // Allocate Memory
+    UWORD Imagesize = ((EPD_GDEH042Z96_WIDTH % 8 == 0)? (EPD_GDEH042Z96_WIDTH / 8 ): (EPD_GDEH042Z96_WIDTH / 8 + 1)) * EPD_GDEH042Z96_HEIGHT;
+    BlackImage = (UBYTE *)malloc(Imagesize);
+    RedImage = (UBYTE *)malloc(Imagesize);
+    Paint_NewImage(BlackImage, EPD_GDEH042Z96_WIDTH, EPD_GDEH042Z96_HEIGHT, 0, WHITE);
+    Paint_NewImage(RedImage, EPD_GDEH042Z96_WIDTH, EPD_GDEH042Z96_HEIGHT, 0, WHITE);
+    
+    // Initial Fetch
+    fetchHAData();
+    fetchWeatherNow();
+    fetchWeatherForecast();
+    
+    float t; int h;
+    readSensor(&t, &h);
+    updateDisplay(t, h);
+    
+    EPD_GDEH042Z96_Sleep();
+}
 
-    // MQTT 设置
-    mqttSetup();
- 
-     // 初始化传感器 I2C
-     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-     
-     // 2. 等待 SHT45 有效数据
-    float temp = 0;
-    int humi = 0;
-    printf("Waiting for SHT45...\r\n");
-    while(!readSensor(&temp, &humi)) {
-        printf("SHT45 Not Ready, retrying...\r\n");
-        delayWithOTA(1000);
-    }
-    printf("SHT45 Ready: %.2f C, %d %%\r\n", temp, humi);
-
-    printf("e-Paper Init...\r\n");
-    EPD_4IN2B_V2_Init();
-    EPD_4IN2B_V2_Clear();
-    DEV_Delay_ms(500);
-
-    UWORD Imagesize = ((EPD_4IN2B_V2_WIDTH % 8 == 0)? (EPD_4IN2B_V2_WIDTH / 8 ): (EPD_4IN2B_V2_WIDTH / 8 + 1)) * EPD_4IN2B_V2_HEIGHT;
-    if((BlackImage = (UBYTE *)malloc(Imagesize)) == NULL) {
-        printf("Failed to apply for black memory...\r\n");
-        while (1);
-    }
-    if((RYImage = (UBYTE *)malloc(Imagesize)) == NULL) {
-        printf("Failed to apply for red/yellow memory...\r\n");
-        while (1);
-    }
-    Paint_NewImage(BlackImage, EPD_4IN2B_V2_WIDTH, EPD_4IN2B_V2_HEIGHT, 0, WHITE);
-    Paint_NewImage(RYImage, EPD_4IN2B_V2_WIDTH, EPD_4IN2B_V2_HEIGHT, 0, WHITE);
- 
-     // 初始获取一次室外天气
-     float tOut = 0; int hOut = 0; String txtOut = "晴";
-     if (fetchOutdoorWeather(&tOut, &hOut, &txtOut)) {
-         last_outdoor_temp = tOut;
-         last_outdoor_humi = hOut;
-         last_weather_text = txtOut;
-     }
- 
-     // 首次显示
-     updateDisplay(temp, humi);
-     
-     // 存储上次的值
-     last_indoor_temp = temp;
-     last_indoor_humi = humi;
-
-     // 初始化实时值
-     realtime_indoor_temp = temp;
-     realtime_indoor_humi = humi;
-    lastSensorTemp = temp;
-    lastSensorHumi = humi;
-    lastSensorSampleMs = millis();
- 
-    printf("Goto Sleep...\r\n");
-    EPD_4IN2B_V2_Sleep();
- }
- 
-/* 主循环 -------------------------------------------------------------*/
- void loop()
-{
-    delayWithOTA(2000);
- 
-    float current_temp = 0;
-    int current_humi = 0;
- 
-    if (readSensor(&current_temp, &current_humi)) {
-       // 检查是否有显著变化以防止抖动
-       // 阈值：温度 0.2°C，湿度 2%
-       
-       bool changed = false;
-       
-       // 过滤无效读数（SHT4x -45 意味着原始值 0，可能是错误）
-       if (current_temp < -40 || current_temp > 85) {
-           Serial.printf("Ignored invalid temp: %.2f\n", current_temp);
-       } else {
-           // 更新 MQTT 的实时值
-           realtime_indoor_temp = current_temp;
-           realtime_indoor_humi = current_humi;
-
-            unsigned long sampleMs = millis();
-            if (lastSensorSampleMs != 0) {
-                unsigned long dtMs = sampleMs - lastSensorSampleMs;
-                if (dtMs > 0) {
-                    float segTemp = (lastSensorTemp + current_temp) * 0.5f;
-                    float segHumi = ((float)lastSensorHumi + (float)current_humi) * 0.5f;
-                    indoorTempWeightedSumMs += (double)segTemp * (double)dtMs;
-                    indoorHumiWeightedSumMs += (double)segHumi * (double)dtMs;
-                    indoorWeightTotalMs += (double)dtMs;
-                }
-            }
-            lastSensorSampleMs = sampleMs;
-            lastSensorTemp = current_temp;
-            lastSensorHumi = current_humi;
-
-           if (abs(current_temp - last_indoor_temp) >= 0.2) {
-               Serial.printf("Temp Changed: Old=%.2f New=%.2f\n", last_indoor_temp, current_temp);
-               changed = true;
-           }
-           
-           if (abs(current_humi - last_indoor_humi) >= 2) {
-               Serial.printf("Humi Changed: Old=%d New=%d\n", last_indoor_humi, current_humi);
-               changed = true;
-           }
-       }
-
-       if (changed) {
-           printf("Change detected! Updating EPD...\r\n");
-           
-           DEV_Module_Init();
-           EPD_4IN2B_V2_Init();
-           
-           updateDisplay(current_temp, current_humi);
-           EPD_4IN2B_V2_Sleep();
-           
-           // 更新上次的值
-           last_indoor_temp = current_temp;
-           last_indoor_humi = current_humi;
-       } else {
-           // 调试打印以显示为什么没有更新
-           // printf("No Change: T=%.2f(%.1f) vs %.2f(%.1f), H=%d vs %d\r\n", current_temp, (float)t1/10.0, last_indoor_temp, (float)t2/10.0, current_humi, last_indoor_humi);
-       }
-    }
- 
-    // MQTT 每 3 秒发布一次，保持精度
+void loop() {
+    unsigned long now = millis();
+    mqttEnsureConnected();
     mqttClient.loop();
-    unsigned long nowMs = millis();
-    if (nowMs - lastMqttPublishMs >= 30000) {
-        if (!mqttDiscoveryPublished) {
-            mqttPublishDiscovery("epaper_temperature_in", "主卧室内温度", "temperature", "°C");
-            mqttPublishDiscovery("epaper_humidity_in", "主卧室内湿度", "humidity", "%");
-            mqttPublishDiscovery("epaper_temperature_out", "EPaper 室外温度", "temperature", "°C");
-            mqttPublishDiscovery("epaper_humidity_out", "EPaper 室外湿度", "humidity", "%");
-            mqttPublishDiscovery("epaper_wifi_rssi", "EPaper WiFi RSSI", "signal_strength", "dBm");
-            mqttPublishDiscovery("epaper_battery_percent", "EPaper 电池", "battery", "%");
-            mqttDiscoveryPublished = true;
+    
+    float t; int h;
+    if (readSensor(&t, &h)) {
+        if (lastSensorSampleMs > 0 && lastSensorTemp > -100.0f) {
+            unsigned long dt = now - lastSensorSampleMs;
+            indoorTempWeightedSumMs += (double)dt * lastSensorTemp;
+            indoorHumiWeightedSumMs += (double)dt * (double)lastSensorHumi;
+            indoorWeightTotalMs += (double)dt;
         }
-
-        if (lastSensorSampleMs != 0) {
-            unsigned long dtTail = nowMs - lastSensorSampleMs;
-            if (dtTail > 0 && realtime_indoor_temp > -40 && realtime_indoor_temp < 85) {
-                float segTemp = realtime_indoor_temp;
-                float segHumi = realtime_indoor_humi;
-                indoorTempWeightedSumMs += (double)segTemp * (double)dtTail;
-                indoorHumiWeightedSumMs += (double)segHumi * (double)dtTail;
-                indoorWeightTotalMs += (double)dtTail;
-            }
-        }
-
-        float avgIndoorTemp;
-        int avgIndoorHumi;
-        if (indoorWeightTotalMs > 0) {
-            float avgTemp = (float)(indoorTempWeightedSumMs / indoorWeightTotalMs);
-            float avgHumi = (float)(indoorHumiWeightedSumMs / indoorWeightTotalMs);
-            avgIndoorTemp = avgTemp;
-            avgIndoorHumi = (int)(avgHumi + 0.5f);
-        } else {
-            avgIndoorTemp = realtime_indoor_temp;
-            avgIndoorHumi = realtime_indoor_humi;
-        }
-
-        publishMetrics(avgIndoorTemp, avgIndoorHumi,
-                       last_outdoor_temp,
-                       last_outdoor_humi);
-        lastMqttPublishMs = nowMs;
-        indoorTempWeightedSumMs = 0;
-        indoorHumiWeightedSumMs = 0;
-        indoorWeightTotalMs = 0;
-        lastSensorSampleMs = nowMs;
+        lastSensorSampleMs = now;
+        lastSensorTemp = t;
+        lastSensorHumi = h;
+        realtime_indoor_temp = t;
+        realtime_indoor_humi = h;
     }
- 
-    if (WiFi.status() == WL_CONNECTED && nowMs - lastWeatherFetchMs >= 600000) {
-        float tOut = 0; int hOut = 0; String txtOut = last_weather_text;
-        if (fetchOutdoorWeather(&tOut, &hOut, &txtOut)) {
-            last_outdoor_temp = tOut;
-            last_outdoor_humi = hOut;
-            last_weather_text = txtOut;
+    
+    if (now - lastMqttPublishMs >= 30000) {
+        float avgT = realtime_indoor_temp;
+        int avgH = realtime_indoor_humi;
+        if (indoorWeightTotalMs > 0.0) {
+            avgT = (float)(indoorTempWeightedSumMs / indoorWeightTotalMs);
+            avgH = (int)((indoorHumiWeightedSumMs / indoorWeightTotalMs) + 0.5);
         }
-        lastWeatherFetchMs = nowMs;
+        mqttPublishKV("temperature_in", String(avgT, 2));
+        mqttPublishKV("humidity_in", String(avgH));
+        if (currentKw.temp.length() > 0) {
+            mqttPublishKV("temperature_out", currentKw.temp);
+        }
+        if (currentKw.humidity.length() > 0) {
+            mqttPublishKV("humidity_out", currentKw.humidity);
+        }
+        mqttPublishKV("wifi_rssi", String(WiFi.RSSI()));
+        indoorTempWeightedSumMs = 0.0;
+        indoorHumiWeightedSumMs = 0.0;
+        indoorWeightTotalMs = 0.0;
+        lastMqttPublishMs = now;
     }
+    
+    if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+    unsigned long nowInterval = (unsigned long)CFG.weather_now_refresh_min * 60000UL;
+    unsigned long forecastInterval = (unsigned long)CFG.weather_forecast_refresh_h * 3600000UL;
+    if (lastNowFetchMs == 0 || now - lastNowFetchMs >= nowInterval) {
+        fetchWeatherNow();
+        lastNowFetchMs = now;
+    }
+    if (lastForecastFetchMs == 0 || now - lastForecastFetchMs >= forecastInterval) {
+        fetchWeatherForecast();
+        fetchHAData();
+        lastForecastFetchMs = now;
+    }
+
+    bool needDisplayUpdate = false;
+    struct tm timeinfo;
+    bool hasTime = getLocalTime(&timeinfo);
+    if (hasTime) {
+        int curMin = timeinfo.tm_min;
+        if (curMin != lastDisplayMinute) {
+            needDisplayUpdate = true;
+            lastDisplayMinute = curMin;
+        }
+        if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0 && lastNtpSyncYday != timeinfo.tm_yday) {
+            configTime(8 * 3600, 0, "ntp.aliyun.com");
+            lastNtpSyncYday = timeinfo.tm_yday;
+        }
+        if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 10 && lastHaUpdateYday != timeinfo.tm_yday) {
+            fetchHAData();
+            lastHaUpdateYday = timeinfo.tm_yday;
+        }
+    }
+
+    if (last_indoor_temp < -900.0f) {
+        last_indoor_temp = realtime_indoor_temp;
+        last_indoor_humi = realtime_indoor_humi;
+    }
+
+    float dTemp = fabs(realtime_indoor_temp - last_indoor_temp);
+    int dHumi = abs(realtime_indoor_humi - last_indoor_humi);
+    if (dTemp >= TEMP_UPDATE_THRESHOLD || dHumi >= HUMI_UPDATE_THRESHOLD) {
+        needDisplayUpdate = true;
+    }
+
+    if (needDisplayUpdate) {
+        DEV_Module_Init();
+        EPD_GDEH042Z96_Init();
+        updateDisplay(realtime_indoor_temp, realtime_indoor_humi);
+        EPD_GDEH042Z96_Sleep();
+        last_indoor_temp = realtime_indoor_temp;
+        last_indoor_humi = realtime_indoor_humi;
+    }
+
+    delay(50);
 }

@@ -3,6 +3,12 @@
 
 #include "fonts.h"
 
-extern cFONT FontNewCN;
+extern cFONT FontCN32;
+extern cFONT FontCN24;
+extern cFONT FontCN24_Num;
+extern cFONT FontCN20;
+extern cFONT FontCN20_Num;
+extern cFONT FontCN16;
+extern cFONT FontCN12;
 
 #endif
