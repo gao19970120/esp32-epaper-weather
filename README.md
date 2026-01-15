@@ -46,6 +46,15 @@
   "qweather_lang": "zh",
   "qweather_unit": "m",
 
+  "qweather_forecast_days": "3d",
+  "weather_now_refresh_min": 15,
+  "weather_forecast_refresh_h": 2,
+
+  "ha_host": "YOUR_HA_HOST",
+  "ha_port": 8123,
+  "ha_token": "YOUR_LONG_LIVED_ACCESS_TOKEN",
+  "ha_lunar_entity": "sensor.your_lunar_sensor",
+
   "battery_adc_pin": -1,
   "battery_scale": 30.0,
 
@@ -95,6 +104,32 @@
 
 - `qweather_unit`  
   - 单位系统，`"m"` 表示公制单位（温度用摄氏度、能见度用公里等）。
+
+- `qweather_forecast_days`  
+  - 控制获取的和风天气预报天数。  
+  - 例如 `"3d"` 表示获取未来 3 天预报，`"7d"` 表示 7 天预报（需与和风账户权限匹配）。
+
+- `weather_now_refresh_min`  
+  - 当前天气（实况）刷新间隔，单位为分钟。  
+  - 示例：`15` 表示每 15 分钟更新一次当前天气数据。
+
+- `weather_forecast_refresh_h`  
+  - 天气预报刷新间隔，单位为小时。  
+  - 示例：`2` 表示每 2 小时更新一次未来预报。
+
+- `ha_host`  
+  - Home Assistant 的访问地址，可以是 IP 或域名，例如 `192.168.1.20` 或 `ha.local`。
+
+- `ha_port`  
+  - Home Assistant 的 HTTP 端口，默认通常为 `8123`。
+
+- `ha_token`  
+  - Home Assistant 的长期访问令牌（Long-Lived Access Token），用于通过 REST API 读取实体数据。  
+  - 在 HA 的用户配置中创建，具有较高权限，请妥善保管。
+
+- `ha_lunar_entity`  
+  - Home Assistant 中用于提供农历信息的实体 ID，例如：`"sensor.chinese_lunar"`。  
+  - 程序会从这个实体中拉取农历日期等信息，用于在墨水屏上显示。
 
 - `battery_adc_pin`  
   - 用于测量电池电压的 ADC 引脚编号；  
