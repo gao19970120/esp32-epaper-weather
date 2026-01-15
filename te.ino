@@ -89,6 +89,7 @@ double indoorWeightTotalMs = 0;
 
 const float TEMP_UPDATE_THRESHOLD = 0.3f;
 const int HUMI_UPDATE_THRESHOLD = 2;
+const unsigned long SENSOR_SAMPLE_INTERVAL_MS = 2000;
 int lastDisplayMinute = -1;
 int lastNtpSyncYday = -1;
 int lastHaUpdateYday = -1;
@@ -245,6 +246,12 @@ unsigned long lastMqttPublishMs = 0;
 unsigned long lastNowFetchMs = 0;
 unsigned long lastForecastFetchMs = 0;
 bool mqttDiscoveryPublished = false;
+unsigned long lastWifiRetryMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
+unsigned long lastMqttRetryMs = 0;
+const unsigned long MQTT_RETRY_INTERVAL_MS = 15000;
+int lastWifiStatus = WL_DISCONNECTED;
+bool otaInited = false;
 
 // 辅助函数：提取 JSON
 bool jsonGetNumber(const String& json, const String& key, float* out) {
@@ -325,18 +332,50 @@ void connectWiFi() {
     printf("Connecting WiFi %s...\r\n", CFG.wifi_ssid.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.begin(CFG.wifi_ssid.c_str(), CFG.wifi_password.c_str());
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 30) {
-        delay(500);
-        printf(".");
-        tries++;
-    }
-    printf("\r\nWiFi Status: %d\r\n", WiFi.status());
 }
 
-static bool mqttEnsureConnected() {
+void setupOTA() {
+    if (otaInited) return;
+    if (CFG.ota_password.length() > 0) {
+        ArduinoOTA.setPassword(CFG.ota_password.c_str());
+    }
+    ArduinoOTA.begin();
+    otaInited = true;
+}
+
+void checkWiFiReconnect() {
+    if (WiFi.status() == WL_CONNECTED) return;
+    if (CFG.wifi_ssid.length() == 0) return;
+    unsigned long now = millis();
+    if (lastWifiRetryMs != 0 && now - lastWifiRetryMs < WIFI_RETRY_INTERVAL_MS) return;
+    lastWifiRetryMs = now;
+    printf("WiFi disconnected, scanning SSID %s\r\n", CFG.wifi_ssid.c_str());
+    int n = WiFi.scanNetworks();
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == CFG.wifi_ssid) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        printf("Target SSID not found\r\n");
+        return;
+    }
+    printf("Target SSID found, trying reconnect\r\n");
+    WiFi.disconnect();
+    WiFi.begin(CFG.wifi_ssid.c_str(), CFG.wifi_password.c_str());
+}
+
+static bool mqttEnsureConnected(bool force = false) {
     if (CFG.mqtt_host.length() == 0) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
     if (!mqttClient.connected()) {
+        unsigned long now = millis();
+        if (!force) {
+            if (lastMqttRetryMs != 0 && now - lastMqttRetryMs < MQTT_RETRY_INTERVAL_MS) return false;
+        }
+        lastMqttRetryMs = now;
         mqttClient.setKeepAlive(30);
         String cid = "esp32_epaper_" + String((uint32_t)ESP.getEfuseMac(), HEX);
         bool ok;
@@ -561,6 +600,28 @@ bool drawIconFromFS(const String& code, int x, int y, int preferredSize) {
         path = "/icons_bin/" + code + ".bin";
         f = LittleFS.open(path, "r");
     }
+    if (!f) {
+        String fallback = code;
+        if (code == "101") {
+            fallback = "100";
+        } else if (code == "151") {
+            fallback = "153";
+        } else if (code == "152") {
+            fallback = "150";
+        } else if (code == "153") {
+            fallback = "103";
+        } else if (code == "154") {
+            fallback = "104";
+        }
+        if (fallback != code) {
+            path = base + fallback + ".bin";
+            f = LittleFS.open(path, "r");
+            if (!f && preferredSize <= 24) {
+                path = "/icons_bin/" + fallback + ".bin";
+                f = LittleFS.open(path, "r");
+            }
+        }
+    }
     if (!f) return false;
 
     size_t fileSize = f.size();
@@ -686,11 +747,25 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
     // 分割线
     Paint_DrawLine(0, 100, 400, 100, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
     
-    // 左侧：室内温湿度 (0,100 - 160,270)
-    snprintf(buf, sizeof(buf), "温度: %.1f℃", indoor_temp);
-    Paint_DrawString_CN(10, 120, buf, &FontCN16, BLACK, WHITE);
-    snprintf(buf, sizeof(buf), "湿度: %d%%", indoor_humi);
-    Paint_DrawString_CN(10, 146, buf, &FontCN16, BLACK, WHITE);
+    int tempInt = (int)indoor_temp;
+    int tempDec = (int)(fabs(indoor_temp) * 10.0f + 0.5f) % 10;
+    char bufInt[16];
+    char bufDecDigit[4];
+    snprintf(bufInt, sizeof(bufInt), "%d", tempInt);
+    snprintf(bufDecDigit, sizeof(bufDecDigit), "%d", tempDec);
+    Paint_DrawString_CN(10, 110, "温度", &FontCN16, BLACK, WHITE);
+    Paint_DrawString_CN(10, 132, bufInt, &FontCN24_Num, BLACK, WHITE);
+    int intLen = strlen(bufInt);
+    int xAfterInt = 10 + 16 * intLen;
+    Paint_DrawString_CN(xAfterInt, 136, ".", &FontCN16, BLACK, WHITE);
+    int xDec = xAfterInt + 16;
+    Paint_DrawString_CN(xDec, 132, bufDecDigit, &FontCN24_Num, BLACK, WHITE);
+    int xUnit = xDec + 16 + 4;
+    Paint_DrawString_CN(xUnit, 136, "℃", &FontCN16, BLACK, WHITE);
+    snprintf(buf, sizeof(buf), "%d", indoor_humi);
+    Paint_DrawString_CN(10, 170, "湿度", &FontCN16, BLACK, WHITE);
+    Paint_DrawString_CN(10, 192, buf, &FontCN24_Num, BLACK, WHITE);
+    Paint_DrawString_CN(10 + 16 * 3 + 4, 196, "%", &FontCN16, BLACK, WHITE);
     
     Paint_DrawRectangle(160, 100, 400, 270, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
     Paint_DrawLine(160, 100, 160, 270, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
@@ -719,8 +794,24 @@ void updateDisplay(float indoor_temp, int indoor_humi) {
         Paint_DrawString_CN(fx + i*75, fy + 80, f.textDay.c_str(), &FontCN16, BLACK, WHITE);
     }
 
-    // 4. 底部：生日信息 (0,270 - 400,300)
+    // 4. 底部：WiFi 状态与生日信息 (0,270 - 400,300)
     Paint_DrawLine(0, 270, 400, 270, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+    
+    String wifiLine = "WiFi ";
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiLine += "OK";
+    } else {
+        wifiLine += "fail";
+    }
+    Paint_DrawString_CN(5, 235, wifiLine.c_str(), &FontCN16, BLACK, WHITE);
+    
+    String mqttLine = "MQTT ";
+    if (CFG.mqtt_host.length() > 0 && mqttClient.connected()) {
+        mqttLine += "OK";
+    } else {
+        mqttLine += "fail";
+    }
+    Paint_DrawString_CN(5, 252, mqttLine.c_str(), &FontCN16, BLACK, WHITE);
     
     if (haData.birthday_summary.length() > 0) {
         // 整行静态显示（超出屏幕部分自动裁切）
@@ -737,12 +828,13 @@ void setup() {
     delay(1000);
     DEV_Module_Init();
     loadConfig();
+    mqttClient.setServer(CFG.mqtt_host.c_str(), CFG.mqtt_port);
     connectWiFi();
     
     if (WiFi.status() == WL_CONNECTED) {
         configTime(8 * 3600, 0, "ntp.aliyun.com");
-        mqttClient.setServer(CFG.mqtt_host.c_str(), CFG.mqtt_port);
-        mqttEnsureConnected();
+        mqttEnsureConnected(true);
+        setupOTA();
     }
     
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -770,22 +862,34 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (wifiConnected && lastWifiStatus != WL_CONNECTED) {
+        configTime(8 * 3600, 0, "ntp.aliyun.com");
+        setupOTA();
+        mqttEnsureConnected(true);
+    }
+    lastWifiStatus = wifiConnected ? WL_CONNECTED : WL_DISCONNECTED;
+    if (otaInited) {
+        ArduinoOTA.handle();
+    }
     mqttEnsureConnected();
     mqttClient.loop();
     
     float t; int h;
-    if (readSensor(&t, &h)) {
-        if (lastSensorSampleMs > 0 && lastSensorTemp > -100.0f) {
-            unsigned long dt = now - lastSensorSampleMs;
-            indoorTempWeightedSumMs += (double)dt * lastSensorTemp;
-            indoorHumiWeightedSumMs += (double)dt * (double)lastSensorHumi;
-            indoorWeightTotalMs += (double)dt;
+    if (lastSensorSampleMs == 0 || now - lastSensorSampleMs >= SENSOR_SAMPLE_INTERVAL_MS) {
+        if (readSensor(&t, &h)) {
+            if (lastSensorSampleMs > 0 && lastSensorTemp > -100.0f) {
+                unsigned long dt = now - lastSensorSampleMs;
+                indoorTempWeightedSumMs += (double)dt * lastSensorTemp;
+                indoorHumiWeightedSumMs += (double)dt * (double)lastSensorHumi;
+                indoorWeightTotalMs += (double)dt;
+            }
+            lastSensorSampleMs = now;
+            lastSensorTemp = t;
+            lastSensorHumi = h;
+            realtime_indoor_temp = t;
+            realtime_indoor_humi = h;
         }
-        lastSensorSampleMs = now;
-        lastSensorTemp = t;
-        lastSensorHumi = h;
-        realtime_indoor_temp = t;
-        realtime_indoor_humi = h;
     }
     
     if (now - lastMqttPublishMs >= 30000) {
@@ -810,15 +914,16 @@ void loop() {
         lastMqttPublishMs = now;
     }
     
-    if (WiFi.status() != WL_CONNECTED) connectWiFi();
+    checkWiFiReconnect();
 
     unsigned long nowInterval = (unsigned long)CFG.weather_now_refresh_min * 60000UL;
     unsigned long forecastInterval = (unsigned long)CFG.weather_forecast_refresh_h * 3600000UL;
-    if (lastNowFetchMs == 0 || now - lastNowFetchMs >= nowInterval) {
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    if (wifiOk && (lastNowFetchMs == 0 || now - lastNowFetchMs >= nowInterval)) {
         fetchWeatherNow();
         lastNowFetchMs = now;
     }
-    if (lastForecastFetchMs == 0 || now - lastForecastFetchMs >= forecastInterval) {
+    if (wifiOk && (lastForecastFetchMs == 0 || now - lastForecastFetchMs >= forecastInterval)) {
         fetchWeatherForecast();
         fetchHAData();
         lastForecastFetchMs = now;
